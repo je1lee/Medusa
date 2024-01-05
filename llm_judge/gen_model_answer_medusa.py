@@ -14,6 +14,9 @@ from tqdm import tqdm
 
 from fastchat.llm_judge.common import load_questions, temperature_config
 from fastchat.model import load_model, get_conversation_template
+import sys
+
+sys.path.append('../')
 
 # Medusa imports
 import transformers
@@ -64,7 +67,7 @@ def medusa_forward(input_ids, model, tokenizer, medusa_choices, temperature, pos
             input_ids, model, medusa_buffers["medusa_attn_mask"], past_key_values
     )
     new_token = 0
-    
+    ar = []
     for idx in range(max_steps): 
         candidates, tree_candidates = generate_candidates(
                 medusa_logits,
@@ -83,6 +86,7 @@ def medusa_forward(input_ids, model, tokenizer, medusa_choices, temperature, pos
         best_candidate, accept_length = evaluate_posterior(
                 logits, candidates, temperature, posterior_threshold, posterior_alpha
             )
+        ar.append(accept_length.item()/4)
         input_ids, logits, medusa_logits, new_token = update_inference_inputs(
                 input_ids,
                 candidates,
@@ -100,7 +104,7 @@ def medusa_forward(input_ids, model, tokenizer, medusa_choices, temperature, pos
             break
         if new_token > 1024:
             break
-    return input_ids, new_token, idx
+    return input_ids, new_token, idx, ar
 
 def run_eval(
     model_path,
@@ -222,7 +226,7 @@ def get_model_answers(
             try:
                 torch.cuda.synchronize()
                 start_time = time.time()
-                output_ids, new_token, idx = medusa_forward(
+                output_ids, new_token, idx, _ = medusa_forward(
                     torch.as_tensor(input_ids).cuda(),
                     model,
                     tokenizer,
@@ -277,6 +281,9 @@ def get_model_answers(
             temperature = temperature_config[question["category"]]
         else:
             temperature = 0.7
+        
+        # temperature hard coded??
+        temperature = 0.0
 
         choices = []
         for i in range(num_choices):
@@ -286,6 +293,7 @@ def get_model_answers(
             idxs = []
             new_tokens = []
             wall_time = []
+            ars = []
             for j in range(len(question["turns"])):
                 qs = question["turns"][j]
                 conv.append_message(conv.roles[0], qs)
@@ -302,7 +310,7 @@ def get_model_answers(
                 try:
                     torch.cuda.synchronize()
                     start_time = time.time()
-                    output_ids, new_token, idx = medusa_forward(
+                    output_ids, new_token, idx, ar = medusa_forward(
                         torch.as_tensor(input_ids).cuda(),
                         model,
                         tokenizer,
@@ -352,9 +360,10 @@ def get_model_answers(
                 idxs.append(int(idx))
                 new_tokens.append(int(new_token))
                 wall_time.append(total_time)
+                ars.append(sum(ar)/len(ar))
                 conv.messages[-1][-1] = output
             # torch.cuda.empty_cache()
-            choices.append({"index": i, "turns": turns, "idxs": idxs, "new_tokens": new_tokens, "wall_time": wall_time})
+            choices.append({"index": i, "turns": turns, "idxs": idxs, "new_tokens": new_tokens, "wall_time": wall_time, "ar": ars})
 
         # Dump answers
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
@@ -388,10 +397,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model-path",
         type=str,
-        required=True,
+        default = "FasterDecoding/medusa-vicuna-33b-v1.3",
+        # required=True,
         help="The path to the weights. This can be a local folder or a Hugging Face repo ID.",
     )
-    parser.add_argument("--model-id", type=str, required=True)
+    parser.add_argument("--model-id", type=str, 
+                        default="medusa-vicuna-33b-v1.3-0",
+                        # required=True
+                        )
     parser.add_argument(
         "--bench-name",
         type=str,
@@ -479,7 +492,7 @@ if __name__ == "__main__":
     if args.answer_file:
         answer_file = args.answer_file
     else:
-        answer_file = f"data/{args.bench_name}/model_answer/{args.model_id}.jsonl"
+        answer_file = f"data/{args.bench_name}/model_answer/medusa_temperature/{args.model_id}_tree.jsonl"
 
     print(f"Output to {answer_file}")
 

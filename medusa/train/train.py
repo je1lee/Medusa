@@ -27,8 +27,13 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset
 import transformers
-from transformers import Trainer, BitsAndBytesConfig
 from transformers.trainer_pt_utils import LabelSmoother
+
+
+from typing import Any, Dict, List, Optional, Union
+
+import sys
+sys.path.append("../..")
 
 from fastchat.conversation import SeparatorStyle
 from fastchat.model.model_adapter import get_conversation_template
@@ -40,62 +45,11 @@ from medusa.model.medusa_model import MedusaModel, MedusaConfig
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
 
-# Customized for training Medusa heads
-class CustomizedTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
-        """
-        Compute the training loss for the model.
-
-        Args:
-            model (torch.nn.Module): The model for which to compute the loss.
-            inputs (dict): The input data, including input IDs, attention mask, and labels.
-            return_outputs (bool): Whether to return model outputs along with the loss.
-
-        Returns:
-            Union[float, Tuple[float, torch.Tensor]]: The computed loss, optionally with model outputs.
-        """
-        # DDP will give us model.module
-        if hasattr(model, "module"):
-            medusa = model.module.medusa
-        else:
-            medusa = model.medusa
-
-        logits = model(
-            input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"]
-        )
-        labels = inputs["labels"]
-        # Shift so that tokens < n predict n
-        loss = 0
-        loss_fct = CrossEntropyLoss()
-        log = {}
-        for i in range(medusa):
-            medusa_logits = logits[i, :, : -(2 + i)].contiguous()
-            medusa_labels = labels[..., 2 + i :].contiguous()
-            medusa_logits = medusa_logits.view(-1, logits.shape[-1])
-            medusa_labels = medusa_labels.view(-1)
-            medusa_labels = medusa_labels.to(medusa_logits.device)
-            loss_i = loss_fct(medusa_logits, medusa_labels)
-            loss += loss_i
-            not_ignore = medusa_labels.ne(IGNORE_TOKEN_ID)
-            medusa_labels = medusa_labels[not_ignore]
-
-            # Add top-k accuracy
-            for k in range(1, 6):
-                _, topk = medusa_logits.topk(k, dim=-1)
-                topk = topk[not_ignore]
-                correct = topk.eq(medusa_labels.unsqueeze(-1)).any(-1)
-                log[f"medusa{i}_top{k}"] = correct.float().mean().item()
-
-            log[f"medusa{i}_loss"] = loss_i.item()
-        self.log(log)
-        return (loss, logits) if return_outputs else loss
-
-
 @dataclass
 class ModelArguments:
-    model_name_or_path: Optional[str] = field(default="lmsys/vicuna-7b-v1.3")
+    model_name_or_path: Optional[str] = field(default="/ssd0/data/fast-llm/Llama-2-70B-Chat-fp16")
     load_in_4bit: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Load in 4 bit."},
     )
     load_in_8bit: bool = field(
@@ -107,7 +61,7 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     data_path: str = field(
-        default="sharegpt_clean.json",
+        default="/ssd0/data/fast-llm/ShareGPT_Vicuna_unfiltered/ShareGPT_V4.3_unfiltered_cleaned_split.json",
         metadata={"help": "Path to the training data."},
     )
     eval_data_path: str = field(
@@ -116,271 +70,137 @@ class DataArguments:
     lazy_preprocess: bool = True
 
 
-@dataclass
-class TrainingArguments(transformers.TrainingArguments):
-    cache_dir: Optional[str] = field(default=None)
-    optim: str = field(default="adamw_torch")
-    model_max_length: int = field(
-        default=2048,
-        metadata={
-            "help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."
-        },
-    )
-    medusa_num_heads: int = field(
-        default=1,
-        metadata={"help": "Number of Medusa heads."},
-    )
-    medusa_num_layers: int = field(
-        default=1,
-        metadata={"help": "Number of layers for each Medusa head."},
-    )
 
+import argparse
+parser = argparse.ArgumentParser(description='sp')
+parser.add_argument('--basepath', type=str, default='/ssd0/data/fast-llm/Llama-2-70B-Chat-fp16')
+parser.add_argument('--configpath', type=str, default="/home/jewon/code/FASTLLM/EAGLE/train/llama_2_chat_70B_config.json")
+parser.add_argument('--lr', type=float, default=3e-5)
+parser.add_argument('--bs', type=int, default=16)
+parser.add_argument('--gradient-accumulation-steps', type=int, default=2)
+parser.add_argument('--tmpdir', type=str, default='/ssd0/data/fast-llm/eagle_train_data')
+parser.add_argument('--outdir', type=str, default='/ssd0/checkpoints/fast-llm/medusa_test_1')
+parser.add_argument('--cpdir', type=str, default='/ssd0/checkpoints/fast-llm/medusa_test_1')
+args = parser.parse_args()
 
-local_rank = None
+train_config={
+    "lr":args.lr,
+    "bs":args.bs,
+    "gradient_accumulation_steps":args.gradient_accumulation_steps,
+    "datapath":f"{args.tmpdir}",
+    "num_epochs":1,
+    "num_warmup_steps":400,
+    "total_steps":4070,
+    "num_workers":16,
+    "max_len":2048,
+    "config_path":args.configpath,
+    "b1":0.9,
+    "b2": 0.95,
+    "grad_clip": 0.5,
+}
 
+def list_files(path):
+    datapath = []
+    for root, directories, files in os.walk(path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            datapath.append(file_path)
+    return datapath
 
-def rank0_print(*args):
-    if local_rank == 0:
-        print(*args)
+class CustomDataset(Dataset):
+    def __init__(self, datapath, transform=None):
+        self.data=datapath
+        self.transform = transform
 
-
-def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
-    """
-    Save the model's state dictionary to a specified directory.
-
-    Args:
-        trainer (transformers.Trainer): The Hugging Face Trainer object.
-        output_dir (str): The directory where the model state dictionary will be saved.
-    """
-    state_dict = trainer.model.state_dict()
-    if trainer.args.should_save:
-        cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
-        del state_dict
-        trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
-
-
-def preprocess(
-    sources,
-    tokenizer: transformers.PreTrainedTokenizer,
-) -> Dict:
-    """
-    Preprocesses conversation data and tokenizes it for model input.
-
-    Args:
-        sources: A list of conversation sources.
-        tokenizer (transformers.PreTrainedTokenizer): The tokenizer to use for tokenization.
-
-    Returns:
-        Dict: A dictionary containing tokenized inputs, labels, and attention mask.
-    """
-    conv = get_conversation_template("vicuna")
-    roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
-
-    # Apply prompt templates
-    conversations = []
-    for i, source in enumerate(sources):
-        if roles[source[0]["from"]] != conv.roles[0]:
-            # Skip the first one if it is not from human
-            source = source[1:]
-
-        conv.messages = []
-        for j, sentence in enumerate(source):
-            role = roles[sentence["from"]]
-            assert role == conv.roles[j % 2], f"{i}, {j}, {role}, {conv.roles[j % 2]}"
-            conv.append_message(role, sentence["value"])
-        conversations.append(conv.get_prompt())
-
-    # Tokenize conversations
-    input_ids = tokenizer(
-        conversations,
-        return_tensors="pt",
-        padding="max_length",
-        max_length=tokenizer.model_max_length,
-        truncation=True,
-    ).input_ids
-    targets = input_ids.clone()
-
-    assert conv.sep_style == SeparatorStyle.ADD_COLON_TWO
-
-    # Mask targets. Only compute loss on the assistant outputs.
-    sep = conv.sep + conv.roles[1] + ": "
-    for conversation, target in zip(conversations, targets):
-        total_len = int(target.ne(tokenizer.pad_token_id).sum())
-
-        turns = conversation.split(conv.sep2)
-        cur_len = 1
-        target[:cur_len] = IGNORE_TOKEN_ID
-        for i, turn in enumerate(turns):
-            if turn == "":
-                break
-            turn_len = len(tokenizer(turn).input_ids)
-
-            parts = turn.split(sep)
-            if len(parts) != 2:
-                break
-            parts[0] += sep
-            # "-2" is hardcoded for the LLaMA tokenizer to make the offset correct.
-            instruction_len = len(tokenizer(parts[0]).input_ids) - 2
-
-            # Ignore the user instructions
-            target[cur_len : cur_len + instruction_len] = IGNORE_TOKEN_ID
-            cur_len += turn_len
-
-        target[cur_len:] = IGNORE_TOKEN_ID
-
-        if False:  # Inspect and check the correctness of masking
-            z = target.clone()
-            z = torch.where(z == IGNORE_TOKEN_ID, tokenizer.unk_token_id, z)
-            rank0_print(tokenizer.decode(z))
-
-        if cur_len < tokenizer.model_max_length:
-            if cur_len != total_len:
-                target[:] = IGNORE_TOKEN_ID
-                rank0_print(
-                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
-                    f" (ignored)"
-                )
-
-    return dict(
-        input_ids=input_ids,
-        labels=targets,
-        attention_mask=input_ids.ne(tokenizer.pad_token_id),
-    )
-
-
-class SupervisedDataset(Dataset):
-    """Dataset for supervised fine-tuning.
-
-    Args:
-        raw_data (list): A list of raw data examples.
-        tokenizer (transformers.PreTrainedTokenizer): The tokenizer to use for data preprocessing.
-    """
-
-    def __init__(self, raw_data, tokenizer: transformers.PreTrainedTokenizer):
-        super(SupervisedDataset, self).__init__()
-
-        rank0_print("Formatting inputs...")
-        sources = [example["conversations"] for example in raw_data]
-        data_dict = preprocess(sources, tokenizer)
-
-        self.input_ids = data_dict["input_ids"]
-        self.labels = data_dict["labels"]
-        self.attention_mask = data_dict["attention_mask"]
 
     def __len__(self):
-        return len(self.input_ids)
-
-    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        return dict(
-            input_ids=self.input_ids[i],
-            labels=self.labels[i],
-            attention_mask=self.attention_mask[i],
-        )
+        return len(self.data)
 
 
-class LazySupervisedDataset(Dataset):
-    """Lazy dataset for supervised fine-tuning.
+    def __getitem__(self, index):
+        # try:
+        data=torch.load(self.data[index])
+        new_data={}
+        hidden_state=data['hidden_state'][:train_config["max_len"]][None,:]
+        input_ids = data['input_ids'][:train_config["max_len"]][None,:]
+        loss_mask = data["loss_mask"][:train_config["max_len"]][None,:]
 
-    This dataset loads data on-the-fly when requested, which can be memory-efficient but slower.
-
-    Args:
-        raw_data (list): A list of raw data examples.
-        tokenizer (transformers.PreTrainedTokenizer): The tokenizer to use for data preprocessing.
-    """
-
-    def __init__(self, raw_data, tokenizer: transformers.PreTrainedTokenizer):
-        super(LazySupervisedDataset, self).__init__()
-        self.tokenizer = tokenizer
-
-        rank0_print("Formatting inputs...Skip in lazy mode")
-        self.tokenizer = tokenizer
-        self.raw_data = raw_data
-        self.cached_data_dict = {}
-
-    def __len__(self):
-        return len(self.raw_data)
-
-    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        if i in self.cached_data_dict:
-            return self.cached_data_dict[i]
-
-        ret = preprocess([self.raw_data[i]["conversations"]], self.tokenizer)
-        ret = dict(
-            input_ids=ret["input_ids"][0],
-            labels=ret["labels"][0],
-            attention_mask=ret["attention_mask"][0],
-        )
-        self.cached_data_dict[i] = ret
-
-        return ret
+        # except:
+        #     with open("error_path.txt", "w") as file:
+        #         file.write(self.data[index])
+        #     print('error path',self.data[index])
 
 
-def make_supervised_data_module(
-    tokenizer: transformers.PreTrainedTokenizer, data_args
-) -> Dict:
-    """Make dataset and collator for supervised fine-tuning.
+        length=hidden_state.shape[1]
+        #length_q = data['query_ids'].shape[1]
+        attention_mask=[1]*length
+        loss_mask=loss_mask[0].tolist()
+        loss_mask[-1]=0
 
-    Args:
-        tokenizer (transformers.PreTrainedTokenizer): The tokenizer to use for data preprocessing.
-        data_args: Data arguments.
+        input_ids_target=input_ids[:,1:]
+        zeropadding = torch.tensor([[0]])
+        input_ids_target = torch.cat((input_ids_target, zeropadding), dim=1)
 
-    Returns:
-        dict: A dictionary containing train and eval datasets.
-    """
-    dataset_cls = (
-        LazySupervisedDataset if data_args.lazy_preprocess else SupervisedDataset
-    )
-    rank0_print("Loading data...")
+        target=hidden_state[:,1:,:]
+        zeropadding=torch.zeros(1, 1, target.shape[2])
+        target=torch.cat((target,zeropadding), dim=1)
+        loss_mask[-1]=0
+        new_data["attention_mask"] = attention_mask
+        new_data["loss_mask"] = loss_mask
+        new_data["target"]=target
+        new_data["hidden_state_big"]=hidden_state
+        new_data["input_ids"] = input_ids_target
+        #sample = torch.cat((data['xs'],data['xb']))
+        # sample=torch.cat((self.data[index]['x'],self.data[index]['logits']))
+        #label = data['y']
 
-    train_json = json.load(open(data_args.data_path, "r"))
-    train_dataset = dataset_cls(train_json, tokenizer=tokenizer)
+        if self.transform:
+            new_data = self.transform(new_data)
 
-    if data_args.eval_data_path:
-        eval_json = json.load(open(data_args.eval_data_path, "r"))
-        eval_dataset = dataset_cls(eval_json, tokenizer=tokenizer)
-    else:
-        eval_dataset = None
+        return new_data
 
-    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset)
+class DataCollatorWithPadding:
+
+
+    def paddingtensor(self,intensors,N):
+        B,n,S=intensors.shape
+        #padding_tensor = torch.zeros(B, N - n, S,dtype=intensors.dtype)
+        padding_tensor = torch.zeros(B, N - n, S)
+        outtensors = torch.cat((intensors, padding_tensor), dim=1)
+        return outtensors
+
+    def paddingtensor2D(self,intensors,N):
+        B,n=intensors.shape
+        padding_tensor = torch.zeros(B, N - n,dtype=intensors.dtype)
+        outtensors = torch.cat((intensors, padding_tensor), dim=1)
+        return outtensors
+
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        max_length = max(item['hidden_state_big'].shape[1] for item in features)
+        batch_input_ids = torch.cat([self.paddingtensor2D(item['input_ids'], max_length) for item in features])
+        batch_hidden_states=torch.cat([self.paddingtensor(item['hidden_state_big'],max_length) for item in features])
+        batch_target = torch.cat([self.paddingtensor(item['target'], max_length) for item in features])
+        batch_loss_mask = torch.tensor([item['loss_mask'] + [0] * (max_length - len(item['loss_mask'])) for item in features])
+        batch_attention_mask = torch.tensor([item['attention_mask'] + [0] * (max_length - len(item['attention_mask'])) for item in features])
+        # batch_loss_mask = torch.ones_like(batch_loss_mask)
+        # batch_attention_mask=torch.ones_like(batch_attention_mask)
+        batch = {
+            "input_ids":batch_input_ids,
+            "hidden_states": batch_hidden_states,
+            "target":batch_target,
+            "attention_mask": batch_attention_mask,
+            "loss_mask": batch_loss_mask,
+        }
+        return batch
 
 
 def train():
-    global local_rank
-
-    parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments)
-    )
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    local_rank = training_args.local_rank
-
-    # Set RoPE scaling factor
-    config = transformers.AutoConfig.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
-    )
-    orig_ctx_len = getattr(config, "max_position_embeddings", None)
-    if orig_ctx_len and training_args.model_max_length > orig_ctx_len:
-        scaling_factor = float(math.ceil(training_args.model_max_length / orig_ctx_len))
-        config.rope_scaling = {"type": "linear", "factor": scaling_factor}
-    config.use_cache = False
-
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-    )
-
     # Load model and tokenizer
     model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
-        config=config,
-        cache_dir=training_args.cache_dir,
+        args.basepath,
         low_cpu_mem_usage=True,
         torch_dtype=torch.bfloat16,
-        quantization_config=quantization_config if model_args.load_in_4bit else None,
-        load_in_4bit=model_args.load_in_4bit,
-        load_in_8bit=model_args.load_in_8bit,
     )
 
     # Freeze the base model
@@ -389,50 +209,105 @@ def train():
 
     # Add Medusa heads
     medusa_lm_head = MedusaModel(
-        model,
-        medusa_num_heads=training_args.medusa_num_heads,
-        medusa_num_layers=training_args.medusa_num_layers,
-        base_model_name_or_path=model_args.model_name_or_path,
+        base_model=model,
+        medusa_num_heads=4,
+        medusa_num_layers=1,
+        base_model_name_or_path=args.basepath,
+        only_medusa=False,
     )
-
-    # Format output dir
-    training_args.output_dir = f"{training_args.output_dir}_medusa_mlp_{model_args.model_name_or_path.split('/')[-1]}_medusa_{training_args.medusa_num_heads}_lr_{training_args.learning_rate}_layers_{training_args.medusa_num_layers}"
+    
+    medusa_heads = medusa_lm_head.medusa_head
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
-        model_max_length=training_args.model_max_length,
+        args.basepath,
+        # cache_dir=training_args.cache_dir,
+        model_max_length=2048,
         padding_side="right",
         use_fast=False,
     )
     tokenizer.pad_token = tokenizer.unk_token
 
-    # Load data
-    data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
 
     # Generate Medusa config for pushing to HF hub
     medusa_config = MedusaConfig(
-        medusa_num_heads=training_args.medusa_num_heads,
-        medusa_num_layers=training_args.medusa_num_layers,
-        base_model_name_or_path=model_args.model_name_or_path,
+        medusa_num_heads=4,
+        medusa_num_layers=1,
+        base_model_name_or_path=args.basepath,
     )
 
     # Save Medusa config
-    medusa_config.save_pretrained(training_args.output_dir)
+    medusa_config.save_pretrained(args.outdir)
+    
+    datapath = list_files(train_config["datapath"])
+    traindatapath=datapath[:int(len(datapath)*0.95)]
+    testdatapath=datapath[int(len(datapath)*0.95):]
 
-    # import pdb; pdb.set_trace()
-    # Start trainner
-    trainer = CustomizedTrainer(
-        model=medusa_lm_head, tokenizer=tokenizer, args=training_args, **data_module
+    train_dataset = CustomDataset(traindatapath)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=train_config["bs"], shuffle=True, num_workers=train_config["num_workers"],collate_fn=DataCollatorWithPadding())
+    test_dataset = CustomDataset(testdatapath)
+    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=train_config["bs"], shuffle=False, num_workers=train_config["num_workers"],collate_fn=DataCollatorWithPadding())
+    
+    from accelerate import Accelerator
+    from accelerate.utils import set_seed
+    set_seed(0)
+    accelerator = Accelerator(mixed_precision='bf16',gradient_accumulation_steps=args.gradient_accumulation_steps)
+    
+    optimizer = torch.optim.AdamW(medusa_heads.parameters(), lr=train_config["lr"])
+    
+    # huggingface cosine scheduler with warmup
+    from transformers import get_cosine_schedule_with_warmup
+
+    lr_scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=train_config["num_warmup_steps"], num_training_steps=train_config["total_steps"])
+    
+    medusa_heads, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        medusa_heads, optimizer, train_dataloader, lr_scheduler
     )
+    
+    if accelerator.is_main_process:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(f"{args.outdir}/logs")
+    
+    global_step=0
+    for epoch in range(1):
+        medusa_heads.train()
+        # medusa_lm_head.train()
+        log_dict = {}
+        for step, batch in enumerate(train_dataloader):
+            optimizer.zero_grad()
+            loss = 0
+            loss_fct = CrossEntropyLoss()
+            for i in range(medusa_config.medusa_num_heads):
+                medusa_logits = medusa_heads.module[i](batch["hidden_states"].to(torch.bfloat16))[:,:-2-i,:].contiguous()
+                medusa_labels = batch["input_ids"][..., 2 + i :].contiguous()
+                medusa_logits = medusa_logits.view(-1, medusa_logits.shape[-1])
+                medusa_labels = medusa_labels.view(-1)
+                medusa_labels = medusa_labels.to(medusa_logits.device)
+                loss_i = loss_fct(medusa_logits, medusa_labels)
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
-    else:
-        trainer.train()
-    model.config.use_cache = True
-    # trainer.save_state()
-    # safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+                # loss_i = loss_fct(medusa_logits.view(-1, medusa_logits.shape[-1]), medusa_labels.view(-1))
+                loss += loss_i
+                not_ignore = medusa_labels.ne(IGNORE_TOKEN_ID)
+                medusa_labels = medusa_labels[not_ignore]
+
+                for k in range(1, 6):
+                    _, topk = medusa_logits.topk(k, dim=-1)
+                    topk = topk[not_ignore]
+                    correct = topk.eq(medusa_labels.unsqueeze(-1)).any(-1)
+                    log_dict[f"medusa{i}_top{k}"] = correct.float().mean().item()
+                
+                log_dict[f"medusa{i}_loss"] = loss_i.item()
+
+            accelerator.backward(loss)
+            accelerator.clip_grad_norm_(medusa_lm_head.parameters(), 1.0)
+            optimizer.step()
+            lr_scheduler.step()
+            global_step += 1
+            if accelerator.is_main_process:
+                writer.add_scalar("lr", lr_scheduler.get_last_lr()[0], global_step)
+                writer.add_scalar("loss", loss.item(), global_step)
+                for k, v in log_dict.items():
+                    writer.add_scalar(k, v, global_step)
+
     # Save MedusaHead seperately
     if hasattr(medusa_lm_head, "module"):
         lm_head = medusa_lm_head.module.medusa_head
@@ -440,11 +315,43 @@ def train():
         lm_head = medusa_lm_head.medusa_head
 
     # Save Medusa heads
-    torch.save(
-        lm_head.state_dict(),
-        os.path.join(training_args.output_dir, "medusa_lm_head.pt"),
-    )
+    accelerator.save_state(output_dir=f"{args.cpdir}/state_{epoch}")
 
+    epoch_loss = 0
+    num_batches = 0
+    medusa_heads.eval()
+    
+    for step, batch in enumerate(test_dataloader):
+        test_log_dict = {}
+        with torch.no_grad():
+            for i in range(medusa_config.medusa_num_heads):
+                medusa_logits = medusa_heads.module[i](batch["hidden_states"].to(torch.bfloat16))[:,:-2,:].contiguous()
+                medusa_labels = batch["input_ids"][..., 2 :].contiguous()
+                medusa_logits = medusa_logits.view(-1, medusa_logits.shape[-1])
+                medusa_labels = medusa_labels.view(-1)
+                medusa_labels = medusa_labels.to(medusa_logits.device)
+                loss_i = loss_fct(medusa_logits, medusa_labels)
+                
+                not_ignore = medusa_labels.ne(IGNORE_TOKEN_ID)
+                medusa_labels = medusa_labels[not_ignore]
 
+                loss += loss_i
+                not_ignore = medusa_labels.ne(IGNORE_TOKEN_ID)
+                medusa_labels = medusa_labels[not_ignore]
+                
+            for k in range(1, 6):
+                _, topk = medusa_logits.topk(k, dim=-1)
+                topk = topk[not_ignore]
+                correct = topk.eq(medusa_labels.unsqueeze(-1)).any(-1)
+                test_log_dict[f"test_medusa{i}_top{k}"] = correct.float().mean().item()
+            
+            test_log_dict[f"test_medusa{i}_loss"] = loss_i.item()
+    
+    if accelerator.is_main_process:
+        for k, v in test_log_dict.items():
+            writer.add_scalar(k, v, epoch+1)
+        epoch_loss += loss.item()
+        num_batches += 1
+            
 if __name__ == "__main__":
     train()

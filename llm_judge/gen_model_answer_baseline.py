@@ -11,6 +11,8 @@ import time
 import shortuuid
 import torch
 from tqdm import tqdm
+import sys
+sys.path.append('..')
 
 from fastchat.llm_judge.common import load_questions, temperature_config
 from fastchat.model import load_model, get_conversation_template
@@ -473,7 +475,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    args.model_id = args.model_id+"-greedy"
+    args.model_id = args.model_id+"-greedy-output-error-7b"
     args.medusa_choices = eval(args.medusa_choices)
     if args.num_gpus_total // args.num_gpus_per_model > 1:
         import ray

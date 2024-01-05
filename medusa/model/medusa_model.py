@@ -80,6 +80,11 @@ class MedusaModel(nn.Module):
         medusa_num_heads=4,
         medusa_num_layers=1,
         base_model_name_or_path="lmsys/vicuna-7b-v1.3",
+<<<<<<< HEAD
+=======
+        only_medusa=False,
+        config=None,
+>>>>>>> a7397f3 (add: tmp)
     ):
         """
         Args:
@@ -88,6 +93,7 @@ class MedusaModel(nn.Module):
             medusa_num_layers (int, optional): Number of ResBlock layers for each Medusa head. Defaults to 0.
         """
         super().__init__()
+<<<<<<< HEAD
         self.base_model = base_model
         self.config = base_model.config
         self.hidden_size = base_model.lm_head.weight.shape[-1]
@@ -95,6 +101,24 @@ class MedusaModel(nn.Module):
         self.medusa = medusa_num_heads
         self.medusa_num_layers = medusa_num_layers
         self.base_model_name_or_path = base_model_name_or_path
+=======
+        if only_medusa:
+            self.base_model = None
+            self.config = config
+            self.hidden_size = config.hidden_size
+            self.vocab_size = config.vocab_size
+            self.medusa = medusa_num_heads
+            self.medusa_num_layers = medusa_num_layers
+            self.base_model_name_or_path = base_model_name_or_path
+        else:
+            self.base_model = base_model
+            self.config = base_model.config
+            self.hidden_size = base_model.lm_head.weight.shape[-1]
+            self.vocab_size = base_model.lm_head.weight.shape[0]
+            self.medusa = medusa_num_heads
+            self.medusa_num_layers = medusa_num_layers
+            self.base_model_name_or_path = base_model_name_or_path
+>>>>>>> a7397f3 (add: tmp)
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path)
         # Create a list of Medusa heads
         self.medusa_head = nn.ModuleList(
@@ -108,7 +132,12 @@ class MedusaModel(nn.Module):
         )
 
         # Ensure medusa_head's dtype and device align with the base_model
+<<<<<<< HEAD
         self.medusa_head.to(self.base_model.dtype).to(self.base_model.device)
+=======
+        if not only_medusa:
+            self.medusa_head.to(self.base_model.dtype).to(self.base_model.device)
+>>>>>>> a7397f3 (add: tmp)
 
         for i in range(medusa_num_heads):
             # Initialize the weights of each medusa_head using the base model's weights
